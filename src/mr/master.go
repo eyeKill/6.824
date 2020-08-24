@@ -1,15 +1,16 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+)
 
 type Master struct {
 	// Your definitions here.
-
+	nReduce int
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -24,6 +25,15 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
+// GetMapJob returns new map job, or nil if there is no map job left.
+func (m *Master) GetMapJob() {
+
+}
+
+// GetReduceJob returns new reduce job, or nil if there is no reduce job left.
+func (m *Master) GetReduceJob() {
+
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -46,10 +56,9 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
+	ret := true
 
 	// Your code here.
-
 
 	return ret
 }
@@ -60,10 +69,8 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
-
-	// Your code here.
-
+	m := Master{nReduce: nReduce}
+	// your code here
 
 	m.server()
 	return &m
