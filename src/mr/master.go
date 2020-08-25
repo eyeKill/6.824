@@ -6,11 +6,16 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync/atomic"
 )
 
 type Master struct {
 	// Your definitions here.
-	nReduce int
+	nReduce             int
+	mapJobs             chan MapJob
+	reduceJobs          chan ReduceJob
+	completedMapJobs    int32
+	completedReduceJobs int32
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -25,14 +30,40 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-// GetMapJob returns new map job, or nil if there is no map job left.
-func (m *Master) GetMapJob() {
-
+// GetMapJob returns new map job, or empty job entry if there is no map job left.
+func (m *Master) GetMapJob(args Empty, reply *MapJob) {
+	job, closed := <-m.mapJobs
+	if !closed {
+		*reply = job
+	}
+	reply = &MapJob{}
 }
 
-// GetReduceJob returns new reduce job, or nil if there is no reduce job left.
-func (m *Master) GetReduceJob() {
+// CompleteMapJob is called when worker completes one map job.
+func (m *Master) CompleteMapJob(args *MapResponse, reply *Empty) {
+	if args.code != OK {
+		atomic.AddInt32(&m.completedMapJobs, 1)
+	} else {
+		m.mapJobs <- args.job // retry
+	}
+}
 
+// GetReduceJob returns new reduce job, or empty job entry if there is no reduce job left.
+func (m *Master) GetReduceJob(args *Empty, reply *ReduceJob) {
+	job, closed := <-m.reduceJobs
+	if !closed {
+		*reply = job
+	}
+	*reply = ReduceJob{}
+}
+
+// CompleteReduceJob is called when worker completes one reduce job.
+func (m *Master) CompleteReduceJob(args *ReduceResponse, reply *Empty) {
+	if args.code == OK {
+		atomic.AddInt32(&m.completedReduceJobs, 1)
+	} else {
+		m.reduceJobs <- args.job
+	}
 }
 
 //
@@ -56,11 +87,8 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := true
-
 	// Your code here.
-
-	return ret
+	return m.completedReduceJobs == int32(m.nReduce)
 }
 
 //
@@ -69,8 +97,13 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{nReduce: nReduce}
-	// your code here
+	m := Master{
+		nReduce:             nReduce,
+		mapJobs:             make(chan MapJob),
+		reduceJobs:          make(chan ReduceJob),
+		completedMapJobs:    0,
+		completedReduceJobs: 0,
+	}
 
 	m.server()
 	return &m

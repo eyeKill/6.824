@@ -24,14 +24,41 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type JobIdentifier string
+
+// MapJob represents a map job. File content is retrieved by worker.
 type MapJob struct {
+	taskNum  int
+	filename string
+	nReduce  int
+}
+
+// ReduceJob represents a reduce job. File content is retrieved by worker.
+type ReduceJob struct {
+	taskNum  int
 	filename string
 }
 
-type ReduceJob struct {
-	filename string
+type ResponseCode int
+
+// Response code
+const (
+	OK ResponseCode = iota
+	Fail
+)
+
+type MapResponse struct {
+	code ResponseCode
+	job  MapJob
 }
+
+type ReduceResponse struct {
+	code ResponseCode
+	job  ReduceJob
+}
+
+// Empty represents the empty type, for handiness.
+type Empty struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

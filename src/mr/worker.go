@@ -3,8 +3,10 @@ package mr
 import (
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
 )
 
 //
@@ -30,12 +32,57 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
+	for {
+		job := GetMapJobFromMaster()
+		if len(job.filename) == 0 {
+			break
+		}
+		// do map
+		file, err := os.Open(job.filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", job.filename)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", job.filename)
+		}
+		file.Close()
+		kva := mapf(job.filename, string(content))
+		// create reduce output files
+		outFiles := make([]*os.File, job.nReduce)
+		for i := 0; i < job.nReduce; i++ {
+			fn := fmt.Sprintf("mr-%d-%d", job.taskNum, i)
+			f, err := os.Create(fn)
+			if err != nil {
+				log.Fatalf("cannot open %v", fn)
+			}
+			outFiles[i] = f
+		}
+		// write all mapped results into separate buckets
+		for _, kv := range kva {
+			h := ihash(kv.Key)
+			fmt.Fprintf(outFiles[h], "%v %v\n", kv.Key, kv.Value)
+		}
+		// close all files
+		for _, f := range outFiles {
+			if f.Close() != nil {
+				log.Fatalf("failed to close %v", f.Name())
+			}
+		}
+		// respond
+		CompleteMapJob(job, true)
+	}
 
 	// uncomment to send the Example RPC to the master.
-	CallExample()
+	// now receive reduce jobs
+	for {
+		job := GetReduceJobFromMaster()
+		if len(job.filename) == 0 {
+			break
+		}
+		// do reduce
 
+	}
 }
 
 //
@@ -59,6 +106,48 @@ func CallExample() {
 
 	// reply.Y should be 100.
 	fmt.Printf("reply.Y %v\n", reply.Y)
+}
+
+// GetMapJobFromMaster get one map job from master, if possible
+func GetMapJobFromMaster() MapJob {
+	args := Empty{}
+	reply := MapJob{}
+	call("Master.GetMapJob", &args, &reply)
+	return reply
+}
+
+// CompleteMapJob notifies the master that the job has been completed.
+func CompleteMapJob(job MapJob, ok bool) {
+	args := MapResponse{}
+	if ok {
+		args.code = OK
+	} else {
+		args.code = Fail
+	}
+	args.job = job
+	reply := Empty{}
+	call("Master.CompleteMapJob", &args, &reply)
+}
+
+// GetReduceJobFromMaster get one reduce job from master, if possible
+func GetReduceJobFromMaster() ReduceJob {
+	args := Empty{}
+	reply := ReduceJob{}
+	call("Master.GetReduceJob", &args, &reply)
+	return reply
+}
+
+// CompleteReduceJob notifies the master that the job has been completed.
+func CompleteReduceJob(job ReduceJob, ok bool) {
+	args := ReduceResponse{}
+	if ok {
+		args.code = OK
+	} else {
+		args.code = Fail
+	}
+	args.job = job
+	reply := Empty{}
+	call("Master.CompleteReduceJob", &args, &reply)
 }
 
 //
