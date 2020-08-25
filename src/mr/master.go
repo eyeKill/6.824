@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
 	"sync/atomic"
 )
 
 type Master struct {
 	// Your definitions here.
 	nReduce             int
+	nJob                int
 	mapJobs             chan MapJob
 	reduceJobs          chan ReduceJob
 	completedMapJobs    int32
@@ -31,39 +33,58 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 }
 
 // GetMapJob returns new map job, or empty job entry if there is no map job left.
-func (m *Master) GetMapJob(args Empty, reply *MapJob) {
+func (m *Master) GetMapJob(args Empty, reply *MapJob) error {
 	job, closed := <-m.mapJobs
 	if !closed {
 		*reply = job
+	} else {
+		reply = &MapJob{TaskNum: -1}
 	}
-	reply = &MapJob{}
+	return nil
 }
 
+var once sync.Once
+
 // CompleteMapJob is called when worker completes one map job.
-func (m *Master) CompleteMapJob(args *MapResponse, reply *Empty) {
-	if args.code != OK {
+func (m *Master) CompleteMapJob(args *MapResponse, reply *Empty) error {
+	if args.Code == OK {
 		atomic.AddInt32(&m.completedMapJobs, 1)
+		if int(m.completedMapJobs) == m.nJob {
+			// get into reduce phase
+			once.Do(func() {
+				for i := 0; i < m.nReduce; i++ {
+					m.reduceJobs <- ReduceJob{
+						TaskNum: i,
+						NMapJob: int(m.nJob),
+					}
+				}
+			})
+		}
 	} else {
-		m.mapJobs <- args.job // retry
+		m.mapJobs <- args.Job // retry
 	}
+	return nil
 }
 
 // GetReduceJob returns new reduce job, or empty job entry if there is no reduce job left.
-func (m *Master) GetReduceJob(args *Empty, reply *ReduceJob) {
+func (m *Master) GetReduceJob(args *Empty, reply *ReduceJob) error {
 	job, closed := <-m.reduceJobs
 	if !closed {
 		*reply = job
+	} else {
+		*reply = ReduceJob{TaskNum: -1}
 	}
-	*reply = ReduceJob{}
+	return nil
 }
 
 // CompleteReduceJob is called when worker completes one reduce job.
-func (m *Master) CompleteReduceJob(args *ReduceResponse, reply *Empty) {
-	if args.code == OK {
+func (m *Master) CompleteReduceJob(args *ReduceResponse, reply *Empty) error {
+	if args.Code == OK {
 		atomic.AddInt32(&m.completedReduceJobs, 1)
 	} else {
-		m.reduceJobs <- args.job
+		m.reduceJobs <- args.Job
 	}
+	return nil
 }
 
 //
@@ -99,12 +120,21 @@ func (m *Master) Done() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{
 		nReduce:             nReduce,
-		mapJobs:             make(chan MapJob),
-		reduceJobs:          make(chan ReduceJob),
+		nJob:                len(files),
+		mapJobs:             make(chan MapJob, len(files)),
+		reduceJobs:          make(chan ReduceJob, nReduce),
 		completedMapJobs:    0,
 		completedReduceJobs: 0,
 	}
-
+	// enqueue all map jobs
+	for i, f := range files {
+		m.mapJobs <- MapJob{
+			TaskNum:  i,
+			Filename: f,
+			NReduce:  m.nReduce,
+		}
+	}
+	log.Println("Master init completed, begin to serve...")
 	m.server()
 	return &m
 }

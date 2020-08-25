@@ -1,12 +1,15 @@
 package mr
 
 import (
+	"bufio"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
+	"strings"
 )
 
 //
@@ -34,24 +37,24 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	for {
 		job := GetMapJobFromMaster()
-		if len(job.filename) == 0 {
+		if len(job.Filename) == 0 {
 			break
 		}
 		// do map
-		file, err := os.Open(job.filename)
+		file, err := os.Open(job.Filename)
 		if err != nil {
-			log.Fatalf("cannot open %v", job.filename)
+			log.Fatalf("cannot open %v", job.Filename)
 		}
 		content, err := ioutil.ReadAll(file)
 		if err != nil {
-			log.Fatalf("cannot read %v", job.filename)
+			log.Fatalf("cannot read %v", job.Filename)
 		}
 		file.Close()
-		kva := mapf(job.filename, string(content))
+		kva := mapf(job.Filename, string(content))
 		// create reduce output files
-		outFiles := make([]*os.File, job.nReduce)
-		for i := 0; i < job.nReduce; i++ {
-			fn := fmt.Sprintf("mr-%d-%d", job.taskNum, i)
+		outFiles := make([]*os.File, job.NReduce)
+		for i := 0; i < job.NReduce; i++ {
+			fn := fmt.Sprintf("mr-%d-%d", job.TaskNum, i)
 			f, err := os.Create(fn)
 			if err != nil {
 				log.Fatalf("cannot open %v", fn)
@@ -73,15 +76,46 @@ func Worker(mapf func(string, string) []KeyValue,
 		CompleteMapJob(job, true)
 	}
 
-	// uncomment to send the Example RPC to the master.
-	// now receive reduce jobs
+	// now receive & run reduce jobs
 	for {
 		job := GetReduceJobFromMaster()
-		if len(job.filename) == 0 {
+		if job.TaskNum < 0 {
 			break
 		}
+		values := make(map[string][]string)
+		for i := 0; i < job.NMapJob; i++ {
+			fn := fmt.Sprintf("mr-%d-%d", i, job.TaskNum)
+			f, err := os.Open(fn)
+			if err != nil {
+				log.Fatalf("failed to open intermediate file %v", fn)
+			}
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				v := strings.Fields(scanner.Text())
+				if len(v) != 2 {
+					log.Fatalf("invalid intermediate output: %v", scanner.Text())
+				}
+				values[v[0]] = append(values[v[0]], v[1])
+			}
+		}
 		// do reduce
-
+		outFn := fmt.Sprintf("mr-out-%d", job.TaskNum)
+		outFile, err := os.Create(outFn)
+		if err != nil {
+			log.Fatalf("cannot open %v", outFn)
+		}
+		// In golang iterating over maps is randomized,
+		// so we have to manually specify the permutation
+		keys := make([]string, 0, len(values))
+		for k := range values {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			result := reducef(k, values[k])
+			fmt.Fprintf(outFile, "%v %v\n", k, result)
+		}
+		outFile.Close()
 	}
 }
 
@@ -110,6 +144,7 @@ func CallExample() {
 
 // GetMapJobFromMaster get one map job from master, if possible
 func GetMapJobFromMaster() MapJob {
+	log.Println("Inquiring map job from master...")
 	args := Empty{}
 	reply := MapJob{}
 	call("Master.GetMapJob", &args, &reply)
@@ -118,19 +153,21 @@ func GetMapJobFromMaster() MapJob {
 
 // CompleteMapJob notifies the master that the job has been completed.
 func CompleteMapJob(job MapJob, ok bool) {
+	log.Printf("Map job %d completed...", job.TaskNum)
 	args := MapResponse{}
 	if ok {
-		args.code = OK
+		args.Code = OK
 	} else {
-		args.code = Fail
+		args.Code = Fail
 	}
-	args.job = job
+	args.Job = job
 	reply := Empty{}
 	call("Master.CompleteMapJob", &args, &reply)
 }
 
 // GetReduceJobFromMaster get one reduce job from master, if possible
 func GetReduceJobFromMaster() ReduceJob {
+	log.Println("Inquiring reduce job from master...")
 	args := Empty{}
 	reply := ReduceJob{}
 	call("Master.GetReduceJob", &args, &reply)
@@ -139,13 +176,14 @@ func GetReduceJobFromMaster() ReduceJob {
 
 // CompleteReduceJob notifies the master that the job has been completed.
 func CompleteReduceJob(job ReduceJob, ok bool) {
+	log.Printf("Reduce job %d completed...", job.TaskNum)
 	args := ReduceResponse{}
 	if ok {
-		args.code = OK
+		args.Code = OK
 	} else {
-		args.code = Fail
+		args.Code = Fail
 	}
-	args.job = job
+	args.Job = job
 	reply := Empty{}
 	call("Master.CompleteReduceJob", &args, &reply)
 }

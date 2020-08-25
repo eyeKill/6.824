@@ -28,15 +28,15 @@ type JobIdentifier string
 
 // MapJob represents a map job. File content is retrieved by worker.
 type MapJob struct {
-	taskNum  int
-	filename string
-	nReduce  int
+	TaskNum  int
+	Filename string
+	NReduce  int
 }
 
 // ReduceJob represents a reduce job. File content is retrieved by worker.
 type ReduceJob struct {
-	taskNum  int
-	filename string
+	TaskNum int
+	NMapJob int
 }
 
 type ResponseCode int
@@ -48,13 +48,13 @@ const (
 )
 
 type MapResponse struct {
-	code ResponseCode
-	job  MapJob
+	Code ResponseCode
+	Job  MapJob
 }
 
 type ReduceResponse struct {
-	code ResponseCode
-	job  ReduceJob
+	Code ResponseCode
+	Job  ReduceJob
 }
 
 // Empty represents the empty type, for handiness.

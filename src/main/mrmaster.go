@@ -9,10 +9,13 @@ package main
 // Please do not change this file.
 //
 
-import "../mr"
-import "time"
-import "os"
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"../mr"
+)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -24,6 +27,6 @@ func main() {
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}
-
+	fmt.Println("Master done, exiting in 1s...")
 	time.Sleep(time.Second)
 }
