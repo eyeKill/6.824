@@ -11,21 +11,6 @@ import (
 	"strconv"
 )
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
-type JobIdentifier string
-
 // MapJob represents a map job. File content is retrieved by worker.
 type MapJob struct {
 	TaskNum  int
@@ -39,6 +24,7 @@ type ReduceJob struct {
 	NMapJob int
 }
 
+// ResponseCode represents the response code, listed as enum.
 type ResponseCode int
 
 // Response code
@@ -47,11 +33,13 @@ const (
 	Fail
 )
 
+// MapResponse is the response for GetMapJob RPC.
 type MapResponse struct {
 	Code ResponseCode
 	Job  MapJob
 }
 
+// ReduceResponse is the response for GetReduceJob RPC.
 type ReduceResponse struct {
 	Code ResponseCode
 	Job  ReduceJob
