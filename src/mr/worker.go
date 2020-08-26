@@ -30,98 +30,110 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type MapFunc func(string, string) []KeyValue
+type ReduceFunc func(string, []string) string
+
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf MapFunc, reducef ReduceFunc) {
+	// query & run map jobs
 	for {
 		job, ok := GetMapJobFromMaster()
 		if !ok {
 			break
 		}
-		// do map
-		file, err := os.Open(job.Filename)
-		if err != nil {
-			log.Fatalf("cannot open %v", job.Filename)
-		}
-		content, err := ioutil.ReadAll(file)
-		file.Close()
-		if err != nil {
-			log.Fatalf("cannot read %v", job.Filename)
-		}
-		kva := mapf(job.Filename, string(content))
-		// create reduce output files
-		outFiles := make([]*os.File, job.NReduce)
-		for i := 0; i < job.NReduce; i++ {
-			fn := fmt.Sprintf("mr-%d-%d", job.TaskNum, i)
-			f, err := os.Create(fn)
-			if err != nil {
-				log.Fatalf("cannot open %v", fn)
-			}
-			outFiles[i] = f
-		}
-		// write all mapped results into separate buckets
-		for _, kv := range kva {
-			h := ihash(kv.Key) % job.NReduce
-			fmt.Fprintf(outFiles[h], "%v %v\n", kv.Key, kv.Value)
-		}
-		// close all files
-		for _, f := range outFiles {
-			if f.Close() != nil {
-				log.Fatalf("failed to close %v", f.Name())
-			}
-		}
-		// respond
-		CompleteMapJob(job, true)
+		ok = doMap(job, mapf)
+		CompleteMapJob(job, ok) // respond
 	}
 
-	// now receive & run reduce jobs
+	// query & run reduce jobs
 	for {
 		job, ok := GetReduceJobFromMaster()
 		if !ok {
 			break
 		}
-		values := make(map[string][]string)
-		for i := 0; i < job.NMapJob; i++ {
-			fn := fmt.Sprintf("mr-%d-%d", i, job.TaskNum)
-			f, err := os.Open(fn)
-			if err != nil {
-				log.Fatalf("failed to open intermediate file %v", fn)
-			}
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				v := strings.Fields(scanner.Text())
-				if len(v) != 2 {
-					log.Fatalf("invalid intermediate output: %v", scanner.Text())
-				}
-				values[v[0]] = append(values[v[0]], v[1])
-			}
-		}
-		// do reduce
-		outFn := fmt.Sprintf("mr-out-%d", job.TaskNum)
-		outFile, err := os.Create(outFn)
-		if err != nil {
-			log.Fatalf("cannot open %v", outFn)
-		}
-		// In golang iterating over maps is randomized,
-		// so we have to manually specify the permutation
-		keys := make([]string, 0, len(values))
-		for k := range values {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			result := reducef(k, values[k])
-			fmt.Fprintf(outFile, "%v %v\n", k, result)
-		}
-		outFile.Close()
-		// respond
-		CompleteReduceJob(job, true)
+		ok = doReduce(job, reducef)
+		CompleteReduceJob(job, ok) // respond
 	}
 }
 
-// GetMapJobFromMaster get one map job from master, if possible
+func doMap(job MapJob, mapf MapFunc) bool {
+	file, err := os.Open(job.Filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", job.Filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	file.Close()
+	if err != nil {
+		log.Fatalf("cannot read %v", job.Filename)
+	}
+	kva := mapf(job.Filename, string(content))
+	// create reduce output files
+	outFiles := make([]*os.File, job.NReduce)
+	for i := 0; i < job.NReduce; i++ {
+		fn := fmt.Sprintf("mr-%d-%d", job.TaskNum, i)
+		f, err := os.Create(fn)
+		if err != nil {
+			log.Fatalf("cannot open %v", fn)
+		}
+		outFiles[i] = f
+	}
+	// write all mapped results into separate buckets
+	for _, kv := range kva {
+		h := ihash(kv.Key) % job.NReduce
+		fmt.Fprintf(outFiles[h], "%v %v\n", kv.Key, kv.Value)
+	}
+	// close all files
+	for _, f := range outFiles {
+		if f.Close() != nil {
+			log.Fatalf("failed to close %v", f.Name())
+		}
+	}
+	return true
+}
+
+func doReduce(job ReduceJob, reducef ReduceFunc) bool {
+	values := make(map[string][]string)
+	for i := 0; i < job.NMapJob; i++ {
+		fn := fmt.Sprintf("mr-%d-%d", i, job.TaskNum)
+		f, err := os.Open(fn)
+		if err != nil {
+			log.Fatalf("failed to open intermediate file %v", fn)
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			v := strings.Fields(scanner.Text())
+			if len(v) != 2 {
+				f.Close()
+				log.Fatalf("invalid intermediate output: %v", scanner.Text())
+			}
+			values[v[0]] = append(values[v[0]], v[1])
+		}
+		f.Close()
+	}
+	// do reduce
+	outFn := fmt.Sprintf("mr-out-%d", job.TaskNum)
+	outFile, err := os.Create(outFn)
+	defer outFile.Close()
+	if err != nil {
+		log.Fatalf("cannot open %v", outFn)
+	}
+	// In golang iterating over maps is randomized,
+	// so we have to manually specify the permutation
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		result := reducef(k, values[k])
+		fmt.Fprintf(outFile, "%v %v\n", k, result)
+	}
+	return true
+}
+
+// GetMapJobFromMaster get one map job from master, if possible.
 func GetMapJobFromMaster() (job MapJob, ok bool) {
 	log.Println("Inquiring map job from master...")
 	args := Empty{}
@@ -132,7 +144,7 @@ func GetMapJobFromMaster() (job MapJob, ok bool) {
 
 // CompleteMapJob notifies the master that the job has been completed.
 func CompleteMapJob(job MapJob, ok bool) {
-	log.Printf("Map job %d completed...", job.TaskNum)
+	log.Printf("Map job %d completed...\n", job.TaskNum)
 	args := MapResponse{}
 	if ok {
 		args.Code = OK
@@ -144,7 +156,7 @@ func CompleteMapJob(job MapJob, ok bool) {
 	call("Master.CompleteMapJob", &args, &reply)
 }
 
-// GetReduceJobFromMaster get one reduce job from master, if possible
+// GetReduceJobFromMaster get one reduce job from master, if possible.
 func GetReduceJobFromMaster() (job ReduceJob, ok bool) {
 	log.Println("Inquiring reduce job from master...")
 	args := Empty{}
