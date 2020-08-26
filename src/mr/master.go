@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-type JobStatus int32
+type JobStatus uint8
 
 const (
 	notStarted JobStatus = iota
@@ -32,8 +32,7 @@ type Master struct {
 	nJob                int
 	mapJobs             chan MapJob
 	reduceJobs          chan ReduceJob
-	closeLock           sync.Mutex
-	closeCond           *sync.Cond
+	closeChan           chan struct{}
 	mapJobStatus        []JobStatus
 	reduceJobStatus     []JobStatus
 	completedMapJobs    int32
@@ -41,15 +40,8 @@ type Master struct {
 }
 
 func (m *Master) sleep(timeout time.Duration) bool {
-	stopped := make(chan struct{})
-	go func() {
-		m.closeLock.Lock()
-		m.closeCond.Wait()
-		m.closeLock.Unlock()
-		close(stopped)
-	}()
 	select {
-	case <-stopped:
+	case <-m.closeChan:
 		return false
 	case <-time.After(timeout):
 		return true
@@ -69,7 +61,7 @@ func (m *Master) GetMapJob(args Empty, reply *MapJob) error {
 				// stop signal received, close immediately
 				return
 			}
-			// TODO use atomic functions here
+			// data race does exist here, but it doesn't mess up the logic
 			if m.mapJobStatus[job.TaskNum] == running {
 				fmt.Printf("Map job %d failed, rescheduling...", job.TaskNum)
 				m.mapJobs <- job
@@ -93,6 +85,7 @@ func (m *Master) CompleteMapJob(args *MapResponse, reply *Empty) error {
 		m.mapJobStatus[args.Job.TaskNum] = finished
 		atomic.AddInt32(&m.completedMapJobs, 1)
 		if int(m.completedMapJobs) == m.nJob {
+			fmt.Println("All map jobs completed.")
 			close(m.mapJobs)
 			// get into reduce phase
 			once.Do(func() {
@@ -122,7 +115,7 @@ func (m *Master) GetReduceJob(args *Empty, reply *ReduceJob) error {
 				// stop signal received, close immediately
 				return
 			}
-			// TODO use atomic functions here
+			// data race does exist here, but it doesn't mess up the logic
 			if m.reduceJobStatus[job.TaskNum] == running {
 				fmt.Printf("Reduce job %d failed, rescheduling...", job.TaskNum)
 				m.reduceJobs <- job
@@ -140,11 +133,13 @@ func (m *Master) CompleteReduceJob(args *ReduceResponse, reply *Empty) error {
 		if m.reduceJobStatus[args.Job.TaskNum] != running {
 			log.Fatalf("Ran into some weird data race bug here, taskNum = %d\n", args.Job.TaskNum)
 		}
+		m.reduceJobStatus[args.Job.TaskNum] = finished
 		atomic.AddInt32(&m.completedReduceJobs, 1)
 		if int(m.completedReduceJobs) == m.nReduce {
+			log.Println("All reduce jobs completed.")
+			// close every sleep goroutine
 			close(m.reduceJobs)
-			// also close every sleep goroutine
-			m.closeCond.Broadcast()
+			close(m.closeChan)
 		}
 	} else {
 		m.reduceJobs <- args.Job
@@ -192,11 +187,10 @@ func MakeMaster(files []string, nReduce int) *Master {
 		// default is notStarted = 0
 		mapJobStatus:        make([]JobStatus, nJob),
 		reduceJobStatus:     make([]JobStatus, nReduce),
+		closeChan:           make(chan struct{}),
 		completedMapJobs:    0,
 		completedReduceJobs: 0,
 	}
-	m.closeLock = sync.Mutex{}
-	m.closeCond = sync.NewCond(&m.closeLock)
 	// enqueue all map jobs
 	for i, f := range files {
 		m.mapJobs <- MapJob{

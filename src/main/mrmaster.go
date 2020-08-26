@@ -27,6 +27,5 @@ func main() {
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}
-	fmt.Println("Master done, exiting in 1s...")
-	time.Sleep(time.Second)
+	fmt.Println("Master done, exiting...")
 }
