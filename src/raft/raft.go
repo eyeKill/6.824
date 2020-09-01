@@ -120,8 +120,10 @@ type Raft struct {
 	matchIndex []uint64
 
 	// runtime channels
-	heartbeatChan     chan struct{}
-	appendReceiveChan chan struct{}
+	heartbeatReceived    bool
+	heartbeatWatcherChan chan struct{}
+	heartbeatMutex       sync.Mutex
+	appendReceiveChan    chan struct{}
 }
 
 // GetState returns currentTerm and whether this server
@@ -130,7 +132,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term := rf.currentTerm
-	isLeader := rf.state == Leader
+	isLeader := rf.getState() == Leader
 	return int(term), isLeader
 }
 
@@ -199,6 +201,21 @@ func (rf *Raft) watchState() chan struct{} {
 	return rf.stateWatchChan
 }
 
+func (rf *Raft) watchHeartbeat() chan struct{} {
+	rf.heartbeatMutex.Lock()
+	defer rf.heartbeatMutex.Unlock()
+	if rf.heartbeatWatcherChan == nil {
+		rf.heartbeatWatcherChan = make(chan struct{})
+	}
+	return rf.heartbeatWatcherChan
+}
+
+func (rf *Raft) sendHeartbeat() chan struct{} {
+	rf.heartbeatMutex.Lock()
+	defer rf.heartbeatMutex.Unlock()
+
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -241,15 +258,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// votedFor is null or current candidate and
 	// candidate's log is up-to-date as receiver's log
 	var logTerm uint32 = 0
+	var logIndex uint64 = rf.commitIndex
 	if len(rf.log) > 0 {
 		logTerm = rf.log[len(rf.log)-1].Term
 	}
 	if rf.votedFor < 0 || rf.votedFor == args.CandidateID {
-		if args.LastLogTerm >= logTerm && args.LastLogIndex >= rf.commitIndex {
+		if args.LastLogTerm >= logTerm && args.LastLogIndex >= logIndex {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateID
-			rf.heartbeatChan <- struct{}{}
 
+			rf.heartbeatChan <- struct{}{}
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 		}
@@ -371,11 +389,9 @@ func (rf *Raft) mainRoutine() {
 	// until the timer fires. If efficiency is a concern,
 	// use NewTimer instead and call Timer.Stop if the timer is no longer needed.
 	for !rf.killed() {
-		rf.mu.Lock()
 		state := rf.getState()
 		log.Printf("Peer %d now state=[Follower, Leader, Candidate][%v]\n", rf.me, state)
 		watchChan := rf.watchState()
-		rf.mu.Unlock()
 		switch state {
 		case Follower:
 			// wait for heartbeat, or become a new candidate
