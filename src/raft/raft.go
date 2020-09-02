@@ -110,7 +110,7 @@ type Raft struct {
 	commitIndex uint64
 	lastApplied uint64
 
-	// state watcher
+	// state variable & its watcher
 	state          RaftState
 	stateWatchChan chan struct{}
 	stateMutex     sync.Mutex
@@ -120,10 +120,8 @@ type Raft struct {
 	matchIndex []uint64
 
 	// runtime channels
-	heartbeatReceived    bool
-	heartbeatWatcherChan chan struct{}
-	heartbeatMutex       sync.Mutex
-	appendReceiveChan    chan struct{}
+	heartbeatChan     chan struct{}
+	appendReceiveChan chan struct{}
 }
 
 // GetState returns currentTerm and whether this server
@@ -192,6 +190,7 @@ func (rf *Raft) setState(newState RaftState) {
 }
 
 // watchState returns a channel that watches the changes of state variable
+// this implementation is not ideal performance-wise, but it enables us to watch in select statement
 func (rf *Raft) watchState() chan struct{} {
 	rf.stateMutex.Lock()
 	defer rf.stateMutex.Unlock()
@@ -201,19 +200,13 @@ func (rf *Raft) watchState() chan struct{} {
 	return rf.stateWatchChan
 }
 
-func (rf *Raft) watchHeartbeat() chan struct{} {
-	rf.heartbeatMutex.Lock()
-	defer rf.heartbeatMutex.Unlock()
-	if rf.heartbeatWatcherChan == nil {
-		rf.heartbeatWatcherChan = make(chan struct{})
+// triggerHeartbeat triggers heart beat signal in a non-blocking manner.
+// Since it does not block, it won't introduce dead locks.
+func (rf *Raft) triggerHeartbeat() {
+	select {
+	case rf.heartbeatChan <- struct{}{}:
+	default:
 	}
-	return rf.heartbeatWatcherChan
-}
-
-func (rf *Raft) sendHeartbeat() chan struct{} {
-	rf.heartbeatMutex.Lock()
-	defer rf.heartbeatMutex.Unlock()
-
 }
 
 //
@@ -242,14 +235,14 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
+
 	if args.Term < rf.currentTerm {
-		// reply false
+		// RequestVote: Reply false if term < currentTerm
 		return
 	} else if args.Term > rf.currentTerm {
-		// If RPC request or response contains term T > currentTerm:
+		// All servers: If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -264,10 +257,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if rf.votedFor < 0 || rf.votedFor == args.CandidateID {
 		if args.LastLogTerm >= logTerm && args.LastLogIndex >= logIndex {
+			// RequestVote: If votedFor is null or candidateId, and candidate’s log is at
+			// least as up-to-date as receiver’s log, grant vote
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateID
-
-			rf.heartbeatChan <- struct{}{}
+			rf.triggerHeartbeat()
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 		}
@@ -278,29 +272,30 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	reply.Success = false
 
-	// candidate
-	if rf.getState() == Candidate {
-		rf.setState(Follower)
-		return
-	}
-
 	if args.Term < rf.currentTerm {
+		// AppendEntries: Reply false if term < currentTerm.
 		return
+	} else if args.Term >= rf.currentTerm {
+		// Candidate: If AppendEntries RPC received from new leader: convert to follower.
+		// All servers: If RPC request contains term T > currentTerm: set currentTerm = T, convert to follower.
+		state := rf.getState()
+		if (state == Candidate || args.Term > rf.currentTerm) && state != Follower {
+			rf.setState(Follower)
+		}
+		rf.currentTerm = args.Term
 	}
 
 	if len(args.Entries) == 0 {
-		// send heartbeat
-		// TODO this might lead to dead lock
-		rf.heartbeatChan <- struct{}{}
+		rf.triggerHeartbeat()
 	} else {
 		// TODO actual append entries
 		log.Fatalln("Append actual entries not implemented.")
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
+		// rf.commitIndex = min(args.LeaderCommit, rf.lastApplied)
 		if args.LeaderCommit < rf.lastApplied {
 			rf.commitIndex = args.LeaderCommit
 		} else {
@@ -391,14 +386,13 @@ func (rf *Raft) mainRoutine() {
 	for !rf.killed() {
 		state := rf.getState()
 		log.Printf("Peer %d now state=[Follower, Leader, Candidate][%v]\n", rf.me, state)
-		watchChan := rf.watchState()
 		switch state {
 		case Follower:
 			// wait for heartbeat, or become a new candidate
 			select {
 			case <-rf.heartbeatChan:
 				// continue
-			case <-watchChan:
+			case <-rf.watchState():
 				// continue
 			case <-time.After(GetElectionTimeout()):
 				// become a candidate
@@ -407,7 +401,7 @@ func (rf *Raft) mainRoutine() {
 		case Candidate:
 			// prepare for leader election
 			rf.mu.Lock()
-			var lastLogTerm uint32 = 0
+			lastLogTerm := uint32(0)
 			if len(rf.log) > 0 {
 				lastLogTerm = rf.log[len(rf.log)-1].Term
 			}
@@ -432,7 +426,6 @@ func (rf *Raft) mainRoutine() {
 			// wait for responses
 			voteCount := 1
 			timeOutChan := time.After(GetElectionTimeout())
-			watchChan := rf.watchState()
 		outer:
 			for {
 				select {
@@ -444,7 +437,7 @@ func (rf *Raft) mainRoutine() {
 							break outer
 						}
 					}
-				case <-watchChan:
+				case <-rf.watchState():
 					// restart everything
 					break outer
 				case <-timeOutChan:
@@ -485,7 +478,7 @@ func (rf *Raft) mainRoutine() {
 func (rf *Raft) Kill() {
 	log.Printf("Killing peer %d...", rf.me)
 	// close(rf.appendReceiveChan)
-	// close(rf.heartbeatChan)
+	close(rf.heartbeatChan)
 	// this indicates that the raft object is closed
 	if rf.stateWatchChan != nil {
 		close(rf.stateWatchChan)
@@ -519,8 +512,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		state:             Follower, // this is default for new servers
 		currentTerm:       0,
 		votedFor:          -1,
-		heartbeatChan:     make(chan struct{}, 8),
-		appendReceiveChan: make(chan struct{}, 8),
+		heartbeatChan:     make(chan struct{}),
+		appendReceiveChan: make(chan struct{}),
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
