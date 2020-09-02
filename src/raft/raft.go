@@ -67,10 +67,8 @@ const (
 )
 
 type LogEntry struct {
-	Action ActionType
-	Term   uint32
-	Key    string
-	Value  string
+	Term    uint32
+	Command interface{}
 }
 
 type AppendEntriesArgs struct {
@@ -290,8 +288,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) == 0 {
 		rf.triggerHeartbeat()
 	} else {
-		// TODO actual append entries
-		log.Fatalln("Append actual entries not implemented.")
+		if uint64(len(rf.log)) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			// AppendEntries: Reply false if log doesn’t contain an entry at prevLogIndex
+			// whose term matches prevLogTerm
+			return
+		}
+		// AppendEntries: If an existing entry conflicts with a new one (same index
+		// but different terms), delete the existing entry and all that follow it.
+		// AppendEntries: Append any new entries not already in the log
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -359,13 +364,27 @@ func (rf *Raft) sendHeartbeat(server int) (ok bool, success bool, term uint32) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	if rf.getState() != Leader {
+		return 0, 0, false
+	}
+	// TODO leader function
+	index, term := rf.ExecuteRequest(command)
+	return int(index), int(term), true
+}
 
-	// Your code here (2B).
-
-	return index, term, isLeader
+func (rf *Raft) ExecuteRequest(command interface{}) (index uint64, term uint32) {
+	// append to local log
+	rf.mu.Lock()
+	rf.nextIndex[rf.me]++
+	index = rf.nextIndex[rf.me]
+	term = rf.currentTerm
+	rf.mu.Unlock()
+	go func() {
+		// append to local log first
+		entry := LogEntry{}
+		rf.log = append(rf.log)
+	}()
+	return
 }
 
 func GetElectionTimeout() time.Duration {
@@ -389,15 +408,16 @@ func (rf *Raft) mainRoutine() {
 		switch state {
 		case Follower:
 			// wait for heartbeat, or become a new candidate
+			t := time.NewTimer(GetElectionTimeout())
 			select {
 			case <-rf.heartbeatChan:
 				// continue
 			case <-rf.watchState():
 				// continue
-			case <-time.After(GetElectionTimeout()):
-				// become a candidate
+			case <-t.C:
 				rf.setState(Candidate)
 			}
+			t.Stop()
 		case Candidate:
 			// prepare for leader election
 			rf.mu.Lock()
@@ -446,10 +466,11 @@ func (rf *Raft) mainRoutine() {
 				}
 			}
 		case Leader:
+			t := time.NewTimer(GetHeartbeatTimeout())
 			select {
 			case <-rf.appendReceiveChan:
 				// do nothing, continue to next cycle
-			case <-time.After(GetHeartbeatTimeout()):
+			case <-t.C:
 				// send heartbeat
 				log.Printf("Peer %d sending heartbeat...\n", rf.me)
 				for i := range rf.peers {
@@ -460,6 +481,7 @@ func (rf *Raft) mainRoutine() {
 				}
 				// TODO maybe add some retry logic?
 			}
+			t.Stop()
 		}
 	}
 }
