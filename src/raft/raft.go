@@ -281,9 +281,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if len(rf.log) > 0 {
 		logTerm = rf.log[len(rf.log)-1].Term
 	}
+
 	if rf.votedFor < 0 || rf.votedFor == args.CandidateID {
 		if args.LastLogTerm >= logTerm && args.LastLogIndex >= logIndex {
-			// RequestVote: If votedFor is null or candidateId, and candidate’s log is at
+			// RequestVot e: If votedFor is null or candidateId, and candidate’s log is at
 			// least as up-to-date as receiver’s log, grant vote
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateID
@@ -322,7 +323,6 @@ func (rf *Raft) heartbeatRoutine(server int) {
 			return
 		}
 		if rf.lastUpdateTime[server].Add(timeout).After(time.Now().Add(time.Duration(5) * time.Millisecond)) {
-			log.Printf("Peer %d -> %d not now!", rf.me, server)
 			rf.mu.Unlock()
 			continue
 		}
@@ -387,8 +387,16 @@ func (rf *Raft) logReplicationRoutine(server int) {
 				rf.nextIndex[server] = lastLogIndex + 1
 				rf.updateCommitIndex()
 			} else {
-				log.Printf("Peer %d - %d append entries failed\n", rf.me, server)
-				rf.nextIndex[server]-- // retry
+				log.Printf("Peer %d -> %d append entries failed\n", rf.me, server)
+				if reply.Term > rf.currentTerm {
+					log.Printf("Peer %d have larger term than self, converting to follower.", server)
+					rf.currentTerm = reply.Term
+					rf.setState(Follower)
+				} else {
+					// Rules for servers: If AppendEntries fails because of log inconsistency,
+					// decrement nextIndex and retry
+					rf.nextIndex[server]--
+				}
 			}
 		} // retry when next request comes in
 		rf.mu.Unlock()
@@ -400,6 +408,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	log.Printf("Peer %d received AppendEntries with %d entries.\n", rf.me, len(args.Entries))
+	reply.Term = rf.currentTerm
 	reply.Success = false
 
 	if args.Term < rf.currentTerm {
@@ -446,14 +455,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
-// applyRoutine sends back commited entries back to server via applyChan
+// applyRoutine sends commited entries back to server via applyChan
 func (rf *Raft) applyRoutine() {
 	rf.mu.Lock()
 	lastCommitIndex := uint64(0)
 	rf.mu.Unlock()
 	for !rf.killed() {
 		rf.mu.Lock()
-		if lastCommitIndex == rf.commitIndex {
+		// >= here: consider reinitialization
+		if lastCommitIndex >= rf.commitIndex {
 			rf.commitIndexUpdateCond.Wait()
 		}
 		newLogs := rf.log[lastCommitIndex:rf.commitIndex]
@@ -482,7 +492,7 @@ func (rf *Raft) sendRequestVote(server int, lastLogTerm uint32) (ok bool, grante
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateID:  rf.me,
-		LastLogIndex: rf.lastApplied,
+		LastLogIndex: rf.commitIndex,
 		LastLogTerm:  lastLogTerm,
 	}
 	rf.mu.Unlock()
@@ -522,9 +532,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.log = append(rf.log, entry)
+	rf.matchIndex[rf.me] = index
 	// signal & leave all other jobs to log replication routines
 	rf.logUpdateCond.Broadcast()
-	log.Printf("Start returning index = %d\n", index)
+	// ... and apply the log locally
 	return int(index), term, true
 }
 
@@ -601,6 +612,7 @@ func (rf *Raft) mainRoutine() {
 					}
 				case <-rf.watchState():
 					// restart everything
+					log.Printf("Peer %d stopping voting due to state change...", rf.me)
 					break outer
 				case <-timeOutChan:
 					// restart election
