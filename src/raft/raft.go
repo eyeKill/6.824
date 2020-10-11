@@ -143,7 +143,6 @@ type Raft struct {
 	matchIndex          []uint64
 	lastUpdateTime      []time.Time
 	matchIndexWatchChan chan struct{}
-	leaderReady         bool // flag to check if leader's routines have started
 
 	// other runtime channels
 	heartbeatChan chan struct{} // Follower
@@ -302,7 +301,7 @@ func (rf *Raft) updateCommitIndex() {
 	copy(indexes, rf.matchIndex)
 	sort.Slice(indexes, func(i int, j int) bool { return indexes[i] < indexes[j] })
 	newCommitIdx := indexes[(len(indexes)-1)/2]
-	log.Printf("Indexs are now: %v\n", indexes)
+	log.Printf("Peer %d: Indexes are now: %v\n", rf.me, rf.matchIndex)
 	if newCommitIdx != rf.commitIndex {
 		log.Printf("Leader's commit index updated to %d\n", newCommitIdx)
 		rf.commitIndex = newCommitIdx
@@ -457,14 +456,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 // applyRoutine sends commited entries back to server via applyChan
 func (rf *Raft) applyRoutine() {
-	rf.mu.Lock()
 	lastCommitIndex := uint64(0)
-	rf.mu.Unlock()
+	state := rf.getState()
 	for !rf.killed() {
 		rf.mu.Lock()
-		// >= here: consider reinitialization
-		if lastCommitIndex >= rf.commitIndex {
+		if lastCommitIndex > rf.commitIndex {
+			panic("FUCK!")
+		}
+		if lastCommitIndex == rf.commitIndex {
 			rf.commitIndexUpdateCond.Wait()
+		}
+		if rf.getState() != state {
+			// reinitialize
+			state = rf.getState()
+			lastCommitIndex = uint64(0)
+			rf.mu.Unlock()
+			continue
 		}
 		newLogs := rf.log[lastCommitIndex:rf.commitIndex]
 		startIndex := lastCommitIndex + 1
@@ -621,25 +628,22 @@ func (rf *Raft) mainRoutine() {
 			}
 		case Leader:
 			// check & start all log replication routines
-			if !rf.leaderReady {
-				lastLogIndex := uint64(len(rf.log))
-				rf.nextIndex = make([]uint64, len(rf.peers))
-				rf.matchIndex = make([]uint64, len(rf.peers))
-				rf.lastUpdateTime = make([]time.Time, len(rf.peers))
-				// set update time to a value far before
-				updateTime := time.Now().Add(-GetHeartbeatTimeout() - time.Duration(1000)*time.Millisecond)
-				for i := range rf.peers {
-					rf.nextIndex[i] = lastLogIndex + 1
-					rf.matchIndex[i] = 0
-					rf.lastUpdateTime[i] = updateTime
+			lastLogIndex := uint64(len(rf.log))
+			rf.nextIndex = make([]uint64, len(rf.peers))
+			rf.matchIndex = make([]uint64, len(rf.peers))
+			rf.lastUpdateTime = make([]time.Time, len(rf.peers))
+			// set update time to a value far before
+			updateTime := time.Now().Add(-GetHeartbeatTimeout() - time.Duration(1000)*time.Millisecond)
+			for i := range rf.peers {
+				rf.nextIndex[i] = lastLogIndex + 1
+				rf.matchIndex[i] = 0
+				rf.lastUpdateTime[i] = updateTime
+			}
+			for i := range rf.peers {
+				if i != rf.me {
+					go rf.heartbeatRoutine(i)
+					go rf.logReplicationRoutine(i)
 				}
-				for i := range rf.peers {
-					if i != rf.me {
-						go rf.heartbeatRoutine(i)
-						go rf.logReplicationRoutine(i)
-					}
-				}
-				rf.leaderReady = true
 			}
 			// wait on state change
 			<-rf.watchState()
